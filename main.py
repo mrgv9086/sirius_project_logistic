@@ -1,10 +1,8 @@
 import json
 import numpy as np
-from scipy.spatial import Delaunay
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon, Point
 import matplotlib.pyplot as plt
-
+import triangle
 
 def read_geojson(input_file):
     """Чтение GeoJSON файла"""
@@ -15,73 +13,113 @@ def read_geojson(input_file):
         print(f"Ошибка чтения файла: {e}")
         return None
 
-
-def extract_points_from_geojson(gdf):
-    """Извлечение точек из GeoDataFrame"""
+def extract_points_and_holes(gdf):
+    """Извлечение всех точек и внутренних контуров (дырок) из GeoDataFrame"""
     points = []
+    holes = []
+    segments = []
 
-    for geometry in gdf.geometry:
-        if geometry.geom_type == 'Point':
+    def extract_coords(geometry, feature_idx):
+        if geometry is None:
+            return
+
+        geom_type = geometry.geom_type
+        if geom_type == 'Point':
             points.append((geometry.x, geometry.y))
-        elif geometry.geom_type in ['Polygon', 'MultiPolygon']:
-            # Для полигонов берем точки границы
-            if geometry.geom_type == 'Polygon':
-                coords = list(geometry.exterior.coords)
-            else:  # MultiPolygon
-                coords = []
-                for poly in geometry.geoms:
-                    coords.extend(list(poly.exterior.coords))
-
-            points.extend(coords)
-        elif geometry.geom_type == 'LineString':
-            points.extend(list(geometry.coords))
-        elif geometry.geom_type == 'MultiPoint':
+        elif geom_type == 'MultiPoint':
             for point in geometry.geoms:
                 points.append((point.x, point.y))
+        elif geom_type == 'LineString':
+            points.extend(geometry.coords)
+            # Добавляем сегменты для линии
+            for i in range(len(geometry.coords) - 1):
+                segments.append((len(points) - len(geometry.coords) + i, len(points) - len(geometry.coords) + i + 1))
+        elif geom_type == 'MultiLineString':
+            for line in geometry.geoms:
+                start_idx = len(points)
+                points.extend(line.coords)
+                for i in range(len(line.coords) - 1):
+                    segments.append((start_idx + i, start_idx + i + 1))
+        elif geom_type == 'Polygon':
+            # Внешний контур
+            start_idx = len(points)
+            exterior_coords = list(geometry.exterior.coords)[:-1]  # Удаляем замыкающую точку
+            points.extend(exterior_coords)
+            for i in range(len(exterior_coords)):
+                segments.append((start_idx + i, start_idx + (i + 1) % len(exterior_coords)))
+            # Внутренние контуры (дырки)
+            for interior in geometry.interiors:
+                interior_coords = list(interior.coords)[:-1]
+                hole_points = interior_coords
+                hole_center = np.mean(hole_points, axis=0)  # Центр дырки
+                holes.append(hole_center)
+                start_idx = len(points)
+                points.extend(hole_points)
+                for i in range(len(hole_points)):
+                    segments.append((start_idx + i, start_idx + (i + 1) % len(hole_points)))
+        elif geom_type == 'MultiPolygon':
+            for poly in geometry.geoms:
+                extract_coords(poly, feature_idx)
+        elif geom_type == 'GeometryCollection':
+            for geom in geometry.geoms:
+                extract_coords(geom, feature_idx)
 
-    # Удаляем дубликаты и преобразуем в список стандартных float
+    for idx, geometry in enumerate(gdf.geometry):
+        extract_coords(geometry, idx)
+
+    # Удаляем дубликаты точек
     unique_points = []
     seen = set()
-
+    point_map = {}
+    new_segments = []
+    idx = 0
     for point in points:
-        # Преобразуем numpy типы в стандартные Python float
         point_tuple = (float(point[0]), float(point[1]))
         if point_tuple not in seen:
             seen.add(point_tuple)
+            point_map[(point[0], point[1])] = idx
             unique_points.append(point_tuple)
+            idx += 1
 
-    return np.array(unique_points)
+    # Обновляем сегменты с учетом уникальных точек
+    for seg in segments:
+        p1 = points[seg[0]]
+        p2 = points[seg[1]]
+        new_seg = (point_map[(p1[0], p1[1])], point_map[(p2[0], p2[1])])
+        if new_seg[0] != new_seg[1]:  # Пропускаем сегменты, соединяющие одну и ту же точку
+            new_segments.append(new_seg)
 
+    return np.array(unique_points), holes, new_segments
 
-def create_triangulation(points):
-    """Создание триангуляции Делоне"""
+def create_constrained_triangulation(points, segments, holes):
+    """Создание ограниченной триангуляции Делоне с учетом дырок"""
     if len(points) < 3:
         print("Недостаточно точек для триангуляции")
         return None
 
-    # Выполняем триангуляцию
-    tri = Delaunay(points)
-    return tri
+    # Подготовка данных для библиотеки triangle
+    tri_input = {
+        'vertices': points,
+        'segments': np.array(segments) if segments else None,
+        'holes': np.array(holes) if holes else None
+    }
 
+    # Выполняем триангуляцию с ограничениями
+    try:
+        tri = triangle.triangulate(tri_input, 'p')
+        return tri
+    except Exception as e:
+        print(f"Ошибка триангуляции: {e}")
+        return None
 
 def create_triangulation_geojson(points, triangles):
     """Создание GeoJSON с триангуляцией"""
+    points_list = [[float(point[0]), float(point[1])] for point in points]
     features = []
-
-    # Преобразуем points в список стандартных Python float
-    points_list = []
-    for point in points:
-        points_list.append([float(point[0]), float(point[1])])
-
     for i, triangle in enumerate(triangles):
-        # Преобразуем индексы треугольника в стандартные Python int
         triangle_indices = [int(j) for j in triangle]
-
-        # Создаем полигон для каждого треугольника
         triangle_points = [points_list[j] for j in triangle_indices]
-        # Замыкаем полигон (первая точка = последняя)
-        triangle_points.append(triangle_points[0])
-
+        triangle_points.append(triangle_points[0])  # Замыкаем полигон
         feature = {
             "type": "Feature",
             "properties": {
@@ -95,14 +133,11 @@ def create_triangulation_geojson(points, triangles):
             }
         }
         features.append(feature)
-
     geojson = {
         "type": "FeatureCollection",
         "features": features
     }
-
     return geojson
-
 
 def save_geojson(geojson_data, output_file):
     """Сохранение GeoJSON в файл"""
@@ -113,23 +148,15 @@ def save_geojson(geojson_data, output_file):
     except Exception as e:
         print(f"Ошибка сохранения файла: {e}")
 
-
 def visualize_triangulation(points, triangles, original_gdf=None):
     """Визуализация триангуляции"""
     try:
         plt.figure(figsize=(12, 8))
-
-        # Отображаем исходные данные если есть
         if original_gdf is not None:
             original_gdf.plot(ax=plt.gca(), color='blue', alpha=0.3, edgecolor='black')
-
-        # Отображаем точки
         plt.plot(points[:, 0], points[:, 1], 'o', color='red', markersize=3)
-
-        # Отображаем треугольники
         plt.triplot(points[:, 0], points[:, 1], triangles, 'g-', alpha=0.7, linewidth=0.8)
-
-        plt.title('Триангуляция Делоне')
+        plt.title('Ограниченная триангуляция Делоне')
         plt.xlabel('Долгота')
         plt.ylabel('Широта')
         plt.grid(True, alpha=0.3)
@@ -138,7 +165,6 @@ def visualize_triangulation(points, triangles, original_gdf=None):
         plt.show()
     except Exception as e:
         print(f"Ошибка визуализации: {e}")
-
 
 def numpy_to_python(obj):
     """Рекурсивно преобразует numpy типы в стандартные Python типы"""
@@ -157,12 +183,9 @@ def numpy_to_python(obj):
     else:
         return obj
 
-
 def safe_save_geojson(geojson_data, output_file):
     """Безопасное сохранение с преобразованием numpy типов"""
-    # Преобразуем все numpy типы в стандартные Python типы
     geojson_safe = numpy_to_python(geojson_data)
-
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(geojson_safe, f, indent=2, ensure_ascii=False)
@@ -172,15 +195,12 @@ def safe_save_geojson(geojson_data, output_file):
         print(f"Ошибка сохранения файла: {e}")
         return False
 
-
 def main():
     input_file = "input.geojson"
     output_file = "triangulation_output.geojson"
 
-    # Чтение исходного GeoJSON
     print("Чтение исходного файла...")
     gdf = read_geojson(input_file)
-
     if gdf is None:
         print("Не удалось прочитать файл")
         return
@@ -188,115 +208,36 @@ def main():
     print(f"Прочитано объектов: {len(gdf)}")
     print(f"Типы геометрий: {set(geom.geom_type for geom in gdf.geometry)}")
 
-    # Извлечение точек
-    print("Извлечение точек...")
-    points = extract_points_from_geojson(gdf)
+    print("Извлечение точек, дырок и сегментов...")
+    points, holes, segments = extract_points_and_holes(gdf)
     print(f"Извлечено уникальных точек: {len(points)}")
+    print(f"Извлечено дырок: {len(holes)}")
+    print(f"Извлечено сегментов: {len(segments)}")
 
     if len(points) < 3:
         print("Недостаточно точек для триангуляции")
         return
 
-    # Создание триангуляции
-    print("Создание триангуляции Делоне...")
-    tri = create_triangulation(points)
-
+    print("Создание ограниченной триангуляции Делоне...")
+    tri = create_constrained_triangulation(points, segments, holes)
     if tri is None:
         print("Не удалось создать триангуляцию")
         return
 
-    print(f"Создано треугольников: {len(tri.simplices)}")
+    print(f"Создано треугольников: {len(tri['triangles'])}")
 
-    # Создание GeoJSON с триангуляцией
     print("Создание выходного GeoJSON...")
-    triangulation_geojson = create_triangulation_geojson(points, tri.simplices)
+    triangulation_geojson = create_triangulation_geojson(points, tri['triangles'])
 
-    # Сохранение результата (используем безопасный метод)
     print("Сохранение результата...")
     success = safe_save_geojson(triangulation_geojson, output_file)
 
     if success:
-        # Визуализация
         print("Визуализация результата...")
-        visualize_triangulation(points, tri.simplices, gdf)
-
+        visualize_triangulation(points, tri['triangles'], gdf)
         print(f"Триангуляция завершена! Результат сохранен в {output_file}")
     else:
         print("Ошибка при сохранении файла")
 
-
-# Упрощенная версия для отладки
-def simple_triangulation():
-    """Упрощенная версия для тестирования"""
-    input_file = "input.geojson"
-    output_file = "simple_triangulation.geojson"
-
-    try:
-        # Чтение данных
-        gdf = gpd.read_file(input_file)
-        print(f"Прочитано объектов: {len(gdf)}")
-
-        # Сбор всех координат
-        all_coords = []
-        for geom in gdf.geometry:
-            if hasattr(geom, 'exterior'):
-                all_coords.extend(list(geom.exterior.coords))
-            elif hasattr(geom, 'coords'):
-                all_coords.extend(list(geom.coords))
-            elif geom.geom_type == 'Point':
-                all_coords.append((geom.x, geom.y))
-
-        # Удаление дубликатов
-        unique_coords = list(set((round(x, 6), round(y, 6)) for x, y in all_coords))
-        points = np.array(unique_coords)
-
-        print(f"Уникальных точек: {len(points)}")
-
-        if len(points) < 3:
-            print("Недостаточно точек")
-            return
-
-        # Триангуляция
-        tri = Delaunay(points)
-        print(f"Создано треугольников: {len(tri.simplices)}")
-
-        # Создание GeoJSON
-        features = []
-        for i, simplex in enumerate(tri.simplices):
-            triangle_coords = []
-            for idx in simplex:
-                triangle_coords.append([float(points[idx][0]), float(points[idx][1])])
-            triangle_coords.append(triangle_coords[0])  # Замыкаем полигон
-
-            feature = {
-                "type": "Feature",
-                "properties": {"id": i},
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [triangle_coords]
-                }
-            }
-            features.append(feature)
-
-        geojson = {
-            "type": "FeatureCollection",
-            "features": features
-        }
-
-        # Сохранение
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(geojson, f, indent=2)
-
-        print(f"Успешно сохранено в {output_file}")
-
-    except Exception as e:
-        print(f"Ошибка: {e}")
-
-
 if __name__ == "__main__":
-    # Основной запуск
     main()
-
-    # Если основной метод не работает, попробуйте упрощенную версию:
-    # print("\n--- Запуск упрощенной версии ---")
-    # simple_triangulation()
